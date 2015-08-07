@@ -416,6 +416,181 @@ module Stripe
           assert_equal true, rescued
         end
       end
+
+      should 'add key to nested objects' do
+        acct = Stripe::Account.construct_from({
+          :id => 'myid',
+          :legal_entity => {
+            :size => 'l',
+            :score => 4,
+            :height => 10
+          }
+        })
+
+        @mock.expects(:post).once.with("#{Stripe.api_base}/v1/accounts/myid", nil, 'legal_entity[first_name]=Bob').returns(make_response({"id" => "myid"}))
+
+        acct.legal_entity.first_name = 'Bob'
+        acct.save
+      end
+
+      should 'save nothing if nothing changes' do
+        acct = Stripe::Account.construct_from({
+          :id => 'myid',
+          :metadata => {
+            :key => 'value'
+          }
+        })
+
+        @mock.expects(:post).once.with("#{Stripe.api_base}/v1/accounts/myid", nil, '').returns(make_response({"id" => "myid"}))
+
+        acct.save
+      end
+
+      should 'not save nested API resources' do
+        ch = Stripe::Charge.construct_from({
+          :id => 'charge_id',
+          :customer => {
+            :object => 'customer',
+            :id => 'customer_id'
+          }
+        })
+
+        @mock.expects(:post).once.with("#{Stripe.api_base}/v1/charges/charge_id", nil, '').returns(make_response({"id" => "charge_id"}))
+
+        ch.customer.description = 'Bob'
+        ch.save
+      end
+
+      should 'correctly handle replaced nested objects' do
+        acct = Stripe::Account.construct_from({
+          :id => 'myid',
+          :legal_entity => {
+            :last_name => 'Smith',
+          }
+        })
+
+        @mock.expects(:post).once.with(
+          "#{Stripe.api_base}/v1/accounts/myid",
+          nil,
+          any_of(
+            'legal_entity[first_name]=Bob&legal_entity[last_name]=',
+            'legal_entity[last_name]=&legal_entity[first_name]=Bob'
+          )
+        ).returns(make_response({"id" => "myid"}))
+
+        acct.legal_entity = {:first_name => 'Bob'}
+        acct.save
+      end
+
+      should 'correctly handle array setting' do
+        acct = Stripe::Account.construct_from({
+          :id => 'myid',
+          :legal_entity => {}
+        })
+
+        @mock.expects(:post).once.with("#{Stripe.api_base}/v1/accounts/myid", nil, 'legal_entity[additional_owners][0][first_name]=Bob').returns(make_response({"id" => "myid"}))
+
+        acct.legal_entity.additional_owners = [{:first_name => 'Bob'}]
+        acct.save
+      end
+
+      should 'correctly handle array insertion' do
+        acct = Stripe::Account.construct_from({
+          :id => 'myid',
+          :legal_entity => {
+            :additional_owners => []
+          }
+        })
+
+        @mock.expects(:post).once.with("#{Stripe.api_base}/v1/accounts/myid", nil, 'legal_entity[additional_owners][0][first_name]=Bob').returns(make_response({"id" => "myid"}))
+
+        acct.legal_entity.additional_owners << {:first_name => 'Bob'}
+        acct.save
+      end
+
+      should 'correctly handle array updates' do
+        acct = Stripe::Account.construct_from({
+          :id => 'myid',
+          :legal_entity => {
+            :additional_owners => [{:first_name => 'Bob'}, {:first_name => 'Jane'}]
+          }
+        })
+
+        @mock.expects(:post).once.with("#{Stripe.api_base}/v1/accounts/myid", nil, 'legal_entity[additional_owners][1][first_name]=Janet').returns(make_response({"id" => "myid"}))
+
+        acct.legal_entity.additional_owners[1].first_name = 'Janet'
+        acct.save
+      end
+
+      should 'correctly handle array noops' do
+        acct = Stripe::Account.construct_from({
+          :id => 'myid',
+          :legal_entity => {
+            :additional_owners => [{:first_name => 'Bob'}]
+          },
+          :currencies_supported => ['usd', 'cad']
+        })
+
+        @mock.expects(:post).once.with("#{Stripe.api_base}/v1/accounts/myid", nil, '').returns(make_response({"id" => "myid"}))
+
+        acct.save
+      end
+
+      should 'correctly handle hash noops' do
+        acct = Stripe::Account.construct_from({
+          :id => 'myid',
+          :legal_entity => {
+            :address => {:line1 => '1 Two Three'}
+          }
+        })
+
+        @mock.expects(:post).once.with("#{Stripe.api_base}/v1/accounts/myid", nil, '').returns(make_response({"id" => "myid"}))
+
+        acct.save
+      end
+
+    end
+
+    should 'retry failed network requests if specified and raise if error persists' do
+      Stripe.expects(:max_retries_on_network_failure).returns(2).at_least_once
+      @mock.expects(:post).times(3).with('https://api.stripe.com/v1/charges', nil, 'amount=50&currency=usd').raises(Errno::ECONNREFUSED.new)
+      
+      err = assert_raises Stripe::APIConnectionError do
+        Stripe::Charge.create(:amount => 50, :currency => 'usd', :card => { :number => nil })
+      end   
+      assert_match(/Request was retried 2 times/, err.message)   
+    end
+
+    should 'retry failed network requests if specified and return successful response' do
+      Stripe.expects(:max_retries_on_network_failure).returns(2).at_least_once
+      callback = Proc.new {}
+      Stripe.expect(:on_successful_retry).returns(callback)
+      response = make_response({"id" => "myid"})
+      err = Errno::ECONNREFUSED.new
+      callback.expects(:call).with(err, response)
+      @mock.expects(:post).times(2).with('https://api.stripe.com/v1/charges', nil, 'amount=50&currency=usd').raises(err).then.returns(response)
+      
+      result = Stripe::Charge.create(:amount => 50, :currency => 'usd', :card => { :number => nil })
+      assert_equal "myid", result.id
+    end
+
+    should 'ensure there is always an idempotency_key' do
+      Stripe.expects(:generate_random_idempotency_key).at_least_once.returns("random_key")
+      Stripe.expects(:max_retries_on_network_failure).returns(2).at_least_once
+      Stripe.expects(:execute_request).with do |opts|
+        opts[:headers][:idempotency_key] == "random_key"
+      end.returns(make_response({"id" => "myid"}))
+
+      Stripe::Charge.create(:amount => 50, :currency => 'usd', :card => { :number => nil })
+    end
+
+    should 'ensure not override a provided idempotency_key' do
+      Stripe.expects(:max_retries_on_network_failure).returns(2).at_least_once
+      Stripe.expects(:execute_request).with do |opts|
+        opts[:headers][:idempotency_key] == "provided_key"
+      end.returns(make_response({"id" => "myid"}))
+
+      Stripe::Charge.create({:amount => 50, :currency => 'usd', :card => { :number => nil }}, {:idempotency_key => 'provided_key'})
     end
   end
 end
